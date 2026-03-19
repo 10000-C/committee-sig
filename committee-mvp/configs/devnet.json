@@ -21,6 +21,7 @@
     "node-7": "127.0.0.1:3407",
     "node-8": "127.0.0.1:3408"
   },
+  "control_addr": "127.0.0.1:4401",
   "committee_size": 8,
   "threshold": 5,
   "coordinator_id": "node-1",

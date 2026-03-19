@@ -8,6 +8,7 @@ mkdir -p "$OUT_DIR"
 for i in $(seq 1 8); do
   node="node-$i"
   port=$((3400 + i))
+  control_port=$((4400 + i))
   {
     echo "{"
     echo "  \"node_id\": \"$node\"," 
@@ -34,6 +35,7 @@ for i in $(seq 1 8); do
     done
     echo "  },"
     cat <<EOF
+  "control_addr": "127.0.0.1:$control_port",
   "committee_size": 8,
   "threshold": 5,
   "coordinator_id": "node-1",

@@ -1,124 +1,19 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
-	"log"
 	"net"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 
-	"committee-mvp/internal/committee"
 	"committee-mvp/internal/config"
 )
-
-func main() {
-	if len(os.Args) >= 2 && !strings.HasPrefix(os.Args[1], "-") {
-		switch os.Args[1] {
-		case "node":
-			if err := runNode(os.Args[2:]); err != nil {
-				log.Fatalf("node failed: %v", err)
-			}
-			return
-		case "admin":
-			if err := runAdmin(os.Args[2:]); err != nil {
-				log.Fatalf("admin failed: %v", err)
-			}
-			return
-		case "version":
-			fmt.Println("committee-mvp v0.1.0")
-			return
-		case "help":
-			printUsage()
-			return
-		default:
-			printUsage()
-			os.Exit(1)
-		}
-	}
-
-	// geth-like default behavior: running without subcommand starts the node.
-	if err := runNode(os.Args[1:]); err != nil {
-		log.Fatalf("node failed: %v", err)
-	}
-}
-
-func runNode(args []string) error {
-	fs := flag.NewFlagSet("node", flag.ContinueOnError)
-	fs.SetOutput(os.Stdout)
-
-	configPath := fs.String("config", "configs/devnet.json", "path to node config file")
-	controlAddr := fs.String("control-addr", "", "optional control address for admin API, e.g. 127.0.0.1:4401")
-	autoSession := fs.String("session", "", "optional session id for coordinator to trigger signing")
-	autoMessage := fs.String("message", "", "optional message for coordinator to trigger signing")
-	autoDelay := fs.Duration("auto-delay", 2*time.Second, "delay before coordinator sends sign request")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		return fmt.Errorf("load config failed: %w", err)
-	}
-	if err := cfg.Validate(); err != nil {
-		return fmt.Errorf("invalid config: %w", err)
-	}
-	if *controlAddr != "" {
-		cfg.ControlAddr = *controlAddr
-	}
-
-	svc := committee.NewService(cfg)
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
-	if err := svc.Start(ctx); err != nil {
-		return fmt.Errorf("service start failed: %w", err)
-	}
-	if cfg.ControlAddr != "" {
-		log.Printf("control server listening on %s", cfg.ControlAddr)
-	}
-	if cfg.NodeID == cfg.CoordinatorID && *autoSession != "" && *autoMessage != "" {
-		go func() {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(*autoDelay):
-			}
-			if err := svc.SubmitSignRequest(*autoSession, []byte(*autoMessage)); err != nil {
-				log.Printf("auto submit sign request failed: %v", err)
-				return
-			}
-			log.Printf("auto submit sign request sent session_id=%s", *autoSession)
-		}()
-	}
-	<-ctx.Done()
-	if err := svc.Stop(context.Background()); err != nil {
-		log.Printf("service stop failed: %v", err)
-	}
-	return nil
-}
-
-func runAdmin(args []string) error {
-	if len(args) < 1 {
-		return errors.New("missing admin subcommand: submit-sign-request | add-peer")
-	}
-	switch args[0] {
-	case "submit-sign-request":
-		return runSubmitSignRequest(args[1:])
-	case "add-peer":
-		return runAddPeer(args[1:])
-	default:
-		return fmt.Errorf("unknown admin subcommand: %s", args[0])
-	}
-}
 
 type controlRequest struct {
 	Action    string `json:"action"`
@@ -131,9 +26,31 @@ type controlResponse struct {
 	Error string `json:"error,omitempty"`
 }
 
+func main() {
+	if len(os.Args) < 2 {
+		printUsage()
+		os.Exit(1)
+	}
+
+	switch os.Args[1] {
+	case "submit-sign-request":
+		if err := runSubmitSignRequest(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "submit-sign-request failed: %v\n", err)
+			os.Exit(1)
+		}
+	case "add-peer":
+		if err := runAddPeer(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "add-peer failed: %v\n", err)
+			os.Exit(1)
+		}
+	default:
+		printUsage()
+		os.Exit(1)
+	}
+}
+
 func runSubmitSignRequest(args []string) error {
-	fs := flag.NewFlagSet("admin submit-sign-request", flag.ContinueOnError)
-	fs.SetOutput(os.Stdout)
+	fs := flag.NewFlagSet("submit-sign-request", flag.ContinueOnError)
 	controlAddr := fs.String("control-addr", "127.0.0.1:4401", "coordinator control address")
 	sessionID := fs.String("session", "", "session id")
 	message := fs.String("message", "", "message to sign")
@@ -152,10 +69,15 @@ func runSubmitSignRequest(args []string) error {
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(*timeout))
 
-	req := controlRequest{Action: "submit_sign_request", SessionID: *sessionID, Message: *message}
+	req := controlRequest{
+		Action:    "submit_sign_request",
+		SessionID: *sessionID,
+		Message:   *message,
+	}
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
 		return fmt.Errorf("encode request: %w", err)
 	}
+
 	var resp controlResponse
 	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
 		return fmt.Errorf("decode response: %w", err)
@@ -166,13 +88,13 @@ func runSubmitSignRequest(args []string) error {
 		}
 		return errors.New(resp.Error)
 	}
+
 	fmt.Printf("submitted sign request session=%s to %s\n", *sessionID, *controlAddr)
 	return nil
 }
 
 func runAddPeer(args []string) error {
-	fs := flag.NewFlagSet("admin add-peer", flag.ContinueOnError)
-	fs.SetOutput(os.Stdout)
+	fs := flag.NewFlagSet("add-peer", flag.ContinueOnError)
 	from := fs.String("from", "", "source node id or all")
 	peer := fs.String("peer", "", "peer node id")
 	addr := fs.String("addr", "", "peer listen address")
@@ -183,6 +105,7 @@ func runAddPeer(args []string) error {
 	if *from == "" || *peer == "" || *addr == "" {
 		return errors.New("from, peer and addr are required")
 	}
+
 	targets, err := resolveTargetConfigs(*configDir, *from)
 	if err != nil {
 		return err
@@ -250,10 +173,7 @@ func appendUnique(in []string, s string) []string {
 }
 
 func printUsage() {
-	fmt.Println("committee-mvp usage (geth-like):")
-	fmt.Println("  committee-mvp [global flags]                  # default to node")
-	fmt.Println("  committee-mvp node --config configs/devnet.json")
-	fmt.Println("  committee-mvp admin submit-sign-request --control-addr 127.0.0.1:4401 --session s1 --message hello")
-	fmt.Println("  committee-mvp admin add-peer --from node-1 --peer node-9 --addr 127.0.0.1:3409")
-	fmt.Println("  committee-mvp version")
+	fmt.Println("committee-cli usage:")
+	fmt.Println("  committee-cli submit-sign-request --control-addr 127.0.0.1:4401 --session s1 --message hello")
+	fmt.Println("  committee-cli add-peer --from node-1 --peer node-9 --addr 127.0.0.1:3409 [--config-dir configs/nodes]")
 }

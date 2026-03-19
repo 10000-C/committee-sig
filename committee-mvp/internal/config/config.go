@@ -13,6 +13,7 @@ type NodeConfig struct {
 	ListenAddr       string            `json:"listen_addr"`
 	StaticNodes      []string          `json:"static_nodes"`
 	StaticNodeAddrs  map[string]string `json:"static_node_addrs"`
+	ControlAddr      string            `json:"control_addr"`
 	CommitteeSize    int               `json:"committee_size"`
 	Threshold        int               `json:"threshold"`
 	CoordinatorID    string            `json:"coordinator_id"`

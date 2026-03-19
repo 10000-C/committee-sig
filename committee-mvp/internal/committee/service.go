@@ -1,11 +1,14 @@
 package committee
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"log"
 	"math/big"
+	"net"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -29,6 +32,7 @@ type Service struct {
 
 	sessions map[string]*signSession
 	mu       sync.Mutex
+	controlL net.Listener
 
 	wg sync.WaitGroup
 }
@@ -71,6 +75,9 @@ func (s *Service) Start(ctx context.Context) error {
 	if err := s.net.Start(ctx); err != nil {
 		return err
 	}
+	if err := s.startControlServer(ctx); err != nil {
+		return err
+	}
 	log.Printf("committee node started node_id=%s threshold=%d static_peers=%d", s.cfg.NodeID, s.cfg.Threshold, len(s.cfg.StaticNodes))
 	s.wg.Add(1)
 	go func() {
@@ -91,11 +98,81 @@ func (s *Service) Start(ctx context.Context) error {
 }
 
 func (s *Service) Stop(ctx context.Context) error {
+	if s.controlL != nil {
+		_ = s.controlL.Close()
+	}
 	if err := s.net.Stop(ctx); err != nil {
 		return err
 	}
 	s.wg.Wait()
 	return nil
+}
+
+func (s *Service) startControlServer(ctx context.Context) error {
+	if s.cfg.ControlAddr == "" {
+		return nil
+	}
+	ln, err := net.Listen("tcp", s.cfg.ControlAddr)
+	if err != nil {
+		return fmt.Errorf("listen control addr %s: %w", s.cfg.ControlAddr, err)
+	}
+	s.controlL = ln
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				return
+			}
+			s.wg.Add(1)
+			go func(c net.Conn) {
+				defer s.wg.Done()
+				s.handleControlConn(c)
+			}(conn)
+		}
+	}()
+	return nil
+}
+
+type controlRequest struct {
+	Action    string `json:"action"`
+	SessionID string `json:"session_id"`
+	Message   string `json:"message"`
+}
+
+type controlResponse struct {
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
+}
+
+func (s *Service) handleControlConn(conn net.Conn) {
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+	line, err := reader.ReadBytes('\n')
+	if err != nil {
+		_ = json.NewEncoder(conn).Encode(controlResponse{OK: false, Error: err.Error()})
+		return
+	}
+	var req controlRequest
+	if err := json.Unmarshal(line, &req); err != nil {
+		_ = json.NewEncoder(conn).Encode(controlResponse{OK: false, Error: fmt.Sprintf("decode request: %v", err)})
+		return
+	}
+	if req.Action != "submit_sign_request" {
+		_ = json.NewEncoder(conn).Encode(controlResponse{OK: false, Error: "unsupported action"})
+		return
+	}
+	if err := s.SubmitSignRequest(req.SessionID, []byte(req.Message)); err != nil {
+		_ = json.NewEncoder(conn).Encode(controlResponse{OK: false, Error: err.Error()})
+		return
+	}
+	_ = json.NewEncoder(conn).Encode(controlResponse{OK: true})
 }
 
 // SubmitSignRequest can be used by coordinator to trigger one signing round.
