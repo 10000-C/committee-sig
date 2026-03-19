@@ -9,17 +9,25 @@ mkdir -p "$LOG_DIR"
 "$ROOT_DIR/scripts/gen-node-configs.sh"
 
 pids=()
+session_id="session-$(date +%s)"
+message="mvp-cross-process-sign"
 for i in $(seq 1 8); do
   cfg="$ROOT_DIR/configs/nodes/node-$i.json"
   log_file="$LOG_DIR/node-$i.log"
   (
     cd "$ROOT_DIR"
-    $BIN -config "$cfg" >> "$log_file" 2>&1
+    if [[ "$i" -eq 1 ]]; then
+      $BIN -config "$cfg" -session "$session_id" -message "$message" >> "$log_file" 2>&1
+    else
+      $BIN -config "$cfg" >> "$log_file" 2>&1
+    fi
   ) &
   pid="$!"
   pids+=("$pid")
   echo "started node-$i pid=$pid log=$log_file"
 done
+
+echo "coordinator auto request session=$session_id message=$message"
 
 cleanup() {
   for pid in "${pids[@]}"; do

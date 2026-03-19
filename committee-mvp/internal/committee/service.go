@@ -20,7 +20,7 @@ import (
 // Service orchestrates committee protocol flow for the MVP runtime.
 type Service struct {
 	cfg *config.NodeConfig
-	net *p2p.StaticNetwork
+	net p2p.Network
 	bls *crypto.BN254BLS
 
 	nodeIndex int
@@ -28,6 +28,7 @@ type Service struct {
 	nonce uint64
 
 	sessions map[string]*signSession
+	mu       sync.Mutex
 
 	wg sync.WaitGroup
 }
@@ -40,6 +41,14 @@ type signSession struct {
 }
 
 func NewService(cfg *config.NodeConfig) *Service {
+	netw := p2p.NewStaticNetwork(cfg.NodeID, cfg.ListenAddr, cfg.StaticNodeAddrs)
+	return NewServiceWithNetwork(cfg, netw)
+}
+
+func NewServiceWithNetwork(cfg *config.NodeConfig, netw p2p.Network) *Service {
+	if netw == nil {
+		netw = p2p.NewStaticNetwork(cfg.NodeID, cfg.ListenAddr, cfg.StaticNodeAddrs)
+	}
 	idx := indexOfNode(cfg.StaticNodes, cfg.NodeID)
 	if idx < 0 {
 		idx = 0
@@ -50,11 +59,11 @@ func NewService(cfg *config.NodeConfig) *Service {
 		panic(err)
 	}
 	return &Service{
-		cfg:      cfg,
-		net:      p2p.NewStaticNetwork(cfg.NodeID, cfg.StaticNodes),
-		bls:      bls,
+		cfg:       cfg,
+		net:       netw,
+		bls:       bls,
 		nodeIndex: idx,
-		sessions: make(map[string]*signSession),
+		sessions:  make(map[string]*signSession),
 	}
 }
 
@@ -102,11 +111,13 @@ func (s *Service) SubmitSignRequest(sessionID string, message []byte) error {
 		return fmt.Errorf("encode sign request: %w", err)
 	}
 	nonce := atomic.AddUint64(&s.nonce, 1)
+	s.mu.Lock()
 	s.sessions[sessionID] = &signSession{
 		message:      append([]byte(nil), message...),
 		responses:    make(map[int]wire.SignResponsePayload),
 		requestNonce: nonce,
 	}
+	s.mu.Unlock()
 	s.net.Publish(wire.Envelope{
 		Type:      wire.MsgSignRequest,
 		SessionID: sessionID,
@@ -149,6 +160,7 @@ func (s *Service) onSignRequest(msg wire.Envelope) {
 	}
 
 	if s.cfg.NodeID == s.cfg.CoordinatorID {
+		s.mu.Lock()
 		if _, ok := s.sessions[msg.SessionID]; !ok {
 			s.sessions[msg.SessionID] = &signSession{
 				message:      append([]byte(nil), req.Message...),
@@ -156,6 +168,7 @@ func (s *Service) onSignRequest(msg wire.Envelope) {
 				requestNonce: msg.Nonce,
 			}
 		}
+		s.mu.Unlock()
 	}
 
 	shareSig, err := s.bls.SignShare(req.Message)
@@ -194,34 +207,42 @@ func (s *Service) onSignResponse(msg wire.Envelope) {
 	if s.cfg.NodeID != s.cfg.CoordinatorID {
 		return
 	}
+	s.mu.Lock()
 	state, ok := s.sessions[msg.SessionID]
 	if !ok {
+		s.mu.Unlock()
 		log.Printf("unknown sign session response ignored session_id=%s from=%s", msg.SessionID, msg.From)
 		return
 	}
 	if state.aggregated {
+		s.mu.Unlock()
 		return
 	}
 
 	var resp wire.SignResponsePayload
 	if err := wire.DecodePayload(msg.Payload, &resp); err != nil {
+		s.mu.Unlock()
 		log.Printf("decode sign response failed session_id=%s from=%s err=%v", msg.SessionID, msg.From, err)
 		return
 	}
 	if resp.SignerIndex < 0 || resp.SignerIndex >= s.cfg.CommitteeSize {
+		s.mu.Unlock()
 		log.Printf("invalid signer index session_id=%s from=%s index=%d", msg.SessionID, msg.From, resp.SignerIndex)
 		return
 	}
 	if _, exists := state.responses[resp.SignerIndex]; exists {
+		s.mu.Unlock()
 		return
 	}
 	if err := s.bls.VerifyShare(resp.SignerPubKey, state.message, resp.ShareSignature); err != nil {
+		s.mu.Unlock()
 		log.Printf("invalid share signature session_id=%s signer_index=%d err=%v", msg.SessionID, resp.SignerIndex, err)
 		return
 	}
 
 	state.responses[resp.SignerIndex] = resp
 	if len(state.responses) < s.cfg.Threshold {
+		s.mu.Unlock()
 		log.Printf("signatures collected session_id=%s progress=%d/%d", msg.SessionID, len(state.responses), s.cfg.Threshold)
 		return
 	}
@@ -239,6 +260,8 @@ func (s *Service) onSignResponse(msg wire.Envelope) {
 		sigs = append(sigs, state.responses[idx].ShareSignature)
 		pubs = append(pubs, state.responses[idx].SignerPubKey)
 	}
+	message := append([]byte(nil), state.message...)
+	s.mu.Unlock()
 	aggSig, err := s.bls.AggregateSignatures(sigs, bitmap)
 	if err != nil {
 		log.Printf("aggregate signatures failed session_id=%s err=%v", msg.SessionID, err)
@@ -249,7 +272,7 @@ func (s *Service) onSignResponse(msg wire.Envelope) {
 		log.Printf("aggregate public keys failed session_id=%s err=%v", msg.SessionID, err)
 		return
 	}
-	if err := s.bls.VerifyAggregate(aggPub, state.message, aggSig, bitmap); err != nil {
+	if err := s.bls.VerifyAggregate(aggPub, message, aggSig, bitmap); err != nil {
 		log.Printf("aggregate verify failed session_id=%s err=%v", msg.SessionID, err)
 		return
 	}
@@ -257,13 +280,15 @@ func (s *Service) onSignResponse(msg wire.Envelope) {
 		Bitmap:             bitmap,
 		AggregateSig:       aggSig,
 		AggregatePublicKey: aggPub,
-		Message:            append([]byte(nil), state.message...),
+		Message:            message,
 	})
 	if err != nil {
 		log.Printf("encode aggregate result failed session_id=%s err=%v", msg.SessionID, err)
 		return
 	}
+	s.mu.Lock()
 	state.aggregated = true
+	s.mu.Unlock()
 	s.net.Publish(wire.Envelope{
 		Type:      wire.MsgAggResult,
 		SessionID: msg.SessionID,

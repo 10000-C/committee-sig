@@ -5,25 +5,35 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 OUT_DIR="$ROOT_DIR/configs/nodes"
 mkdir -p "$OUT_DIR"
 
-static_nodes_json=""
-for i in $(seq 1 8); do
-  node="node-$i"
-  if [[ -n "$static_nodes_json" ]]; then
-    static_nodes_json+="\n    ,\"$node\""
-  else
-    static_nodes_json+="\n    \"$node\""
-  fi
-done
-
 for i in $(seq 1 8); do
   node="node-$i"
   port=$((3400 + i))
-  cat > "$OUT_DIR/$node.json" <<EOF
-{
-  "node_id": "$node",
-  "listen_addr": "127.0.0.1:$port",
-  "static_nodes": [$static_nodes_json
-  ],
+  {
+    echo "{"
+    echo "  \"node_id\": \"$node\"," 
+    echo "  \"listen_addr\": \"127.0.0.1:$port\"," 
+    echo "  \"static_nodes\": ["
+    for j in $(seq 1 8); do
+      peer="node-$j"
+      comma="," 
+      if [[ "$j" -eq 8 ]]; then
+        comma=""
+      fi
+      echo "    \"$peer\"$comma"
+    done
+    echo "  ],"
+    echo "  \"static_node_addrs\": {"
+    for j in $(seq 1 8); do
+      peer="node-$j"
+      peer_addr="127.0.0.1:$((3400 + j))"
+      comma="," 
+      if [[ "$j" -eq 8 ]]; then
+        comma=""
+      fi
+      echo "    \"$peer\": \"$peer_addr\"$comma"
+    done
+    echo "  },"
+    cat <<EOF
   "committee_size": 8,
   "threshold": 5,
   "coordinator_id": "node-1",
@@ -31,6 +41,7 @@ for i in $(seq 1 8); do
   "message_version": "v1"
 }
 EOF
+  } > "$OUT_DIR/$node.json"
 done
 
 echo "generated configs in $OUT_DIR"

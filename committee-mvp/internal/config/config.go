@@ -9,14 +9,15 @@ import (
 
 // NodeConfig is a static configuration for a committee node in MVP.
 type NodeConfig struct {
-	NodeID          string   `json:"node_id"`
-	ListenAddr      string   `json:"listen_addr"`
-	StaticNodes     []string `json:"static_nodes"`
-	CommitteeSize   int      `json:"committee_size"`
-	Threshold       int      `json:"threshold"`
-	CoordinatorID   string   `json:"coordinator_id"`
+	NodeID           string            `json:"node_id"`
+	ListenAddr       string            `json:"listen_addr"`
+	StaticNodes      []string          `json:"static_nodes"`
+	StaticNodeAddrs  map[string]string `json:"static_node_addrs"`
+	CommitteeSize    int               `json:"committee_size"`
+	Threshold        int               `json:"threshold"`
+	CoordinatorID    string            `json:"coordinator_id"`
 	DomainSeparation string  `json:"domain_separation"`
-	MessageVersion  string   `json:"message_version"`
+	MessageVersion   string            `json:"message_version"`
 }
 
 func Load(path string) (*NodeConfig, error) {
@@ -49,6 +50,15 @@ func (c *NodeConfig) Validate() error {
 	}
 	if len(c.StaticNodes) == 0 {
 		return errors.New("static_nodes cannot be empty")
+	}
+	if len(c.StaticNodeAddrs) == 0 {
+		return errors.New("static_node_addrs cannot be empty")
+	}
+	for _, nodeID := range c.StaticNodes {
+		addr, ok := c.StaticNodeAddrs[nodeID]
+		if !ok || addr == "" {
+			return fmt.Errorf("missing static_node_addrs entry for %s", nodeID)
+		}
 	}
 	if c.CoordinatorID == "" {
 		return errors.New("coordinator_id is required")

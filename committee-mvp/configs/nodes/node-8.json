@@ -1,8 +1,26 @@
 {
   "node_id": "node-8",
   "listen_addr": "127.0.0.1:3408",
-  "static_nodes": [\n    "node-1"\n    ,"node-2"\n    ,"node-3"\n    ,"node-4"\n    ,"node-5"\n    ,"node-6"\n    ,"node-7"\n    ,"node-8"
+  "static_nodes": [
+    "node-1",
+    "node-2",
+    "node-3",
+    "node-4",
+    "node-5",
+    "node-6",
+    "node-7",
+    "node-8"
   ],
+  "static_node_addrs": {
+    "node-1": "127.0.0.1:3401",
+    "node-2": "127.0.0.1:3402",
+    "node-3": "127.0.0.1:3403",
+    "node-4": "127.0.0.1:3404",
+    "node-5": "127.0.0.1:3405",
+    "node-6": "127.0.0.1:3406",
+    "node-7": "127.0.0.1:3407",
+    "node-8": "127.0.0.1:3408"
+  },
   "committee_size": 8,
   "threshold": 5,
   "coordinator_id": "node-1",
