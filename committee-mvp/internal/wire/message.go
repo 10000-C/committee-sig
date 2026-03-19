@@ -1,6 +1,9 @@
 package wire
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 type MessageType uint8
 
@@ -23,4 +26,29 @@ type Envelope struct {
 	Version   string      `json:"version"`
 	SentAt    time.Time   `json:"sent_at"`
 	Payload   []byte      `json:"payload"`
+}
+
+type SignRequestPayload struct {
+	Message []byte `json:"message"`
+}
+
+type SignResponsePayload struct {
+	SignerIndex    int    `json:"signer_index"`
+	ShareSignature []byte `json:"share_signature"`
+	SignerPubKey   []byte `json:"signer_pub_key"`
+}
+
+type AggResultPayload struct {
+	Bitmap            []byte `json:"bitmap"`
+	AggregateSig      []byte `json:"aggregate_signature"`
+	AggregatePublicKey []byte `json:"aggregate_public_key"`
+	Message           []byte `json:"message"`
+}
+
+func EncodePayload(v interface{}) ([]byte, error) {
+	return json.Marshal(v)
+}
+
+func DecodePayload(b []byte, v interface{}) error {
+	return json.Unmarshal(b, v)
 }
