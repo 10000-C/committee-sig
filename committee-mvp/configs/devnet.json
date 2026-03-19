@@ -1,0 +1,19 @@
+{
+  "node_id": "node-1",
+  "listen_addr": "127.0.0.1:3401",
+  "static_nodes": [
+    "node-1",
+    "node-2",
+    "node-3",
+    "node-4",
+    "node-5",
+    "node-6",
+    "node-7",
+    "node-8"
+  ],
+  "committee_size": 8,
+  "threshold": 5,
+  "coordinator_id": "node-1",
+  "domain_separation": "committee-sig/mvp/v1",
+  "message_version": "v1"
+}
