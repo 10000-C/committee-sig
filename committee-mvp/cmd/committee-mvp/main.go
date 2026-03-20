@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -116,7 +117,7 @@ func runNode(args []string) error {
 
 func runAdmin(args []string) error {
 	if len(args) < 1 {
-		return errors.New("missing admin subcommand: submit-sign-request | set-auto-sign | sign-session | get-committee-pubkey | add-peer")
+		return errors.New("missing admin subcommand: submit-sign-request | set-auto-sign | sign-session | get-committee-pubkey | console | add-peer")
 	}
 	switch args[0] {
 	case "submit-sign-request":
@@ -127,6 +128,8 @@ func runAdmin(args []string) error {
 		return runSignSession(args[1:])
 	case "get-committee-pubkey":
 		return runGetCommitteePubKey(args[1:])
+	case "console":
+		return runAdminConsole(args[1:])
 	case "add-peer":
 		return runAddPeer(args[1:])
 	default:
@@ -228,6 +231,130 @@ func runGetCommitteePubKey(args []string) error {
 	}
 	fmt.Printf("committee_pub_key_hex=%s\n", resp.CommitteePubKey)
 	return nil
+}
+
+func runAdminConsole(args []string) error {
+	fs := flag.NewFlagSet("admin console", flag.ContinueOnError)
+	fs.SetOutput(os.Stdout)
+	controlAddr := fs.String("control-addr", "127.0.0.1:4401", "default node control address")
+	timeout := fs.Duration("timeout", 3*time.Second, "request timeout")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	currentAddr := *controlAddr
+	reader := bufio.NewReader(os.Stdin)
+
+	fmt.Println("interactive admin console")
+	fmt.Println("type 'help' for commands, 'exit' to quit")
+	fmt.Printf("current target: %s\n", currentAddr)
+
+	for {
+		fmt.Printf("[%s] > ", currentAddr)
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return err
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		parts := strings.Fields(line)
+		cmd := strings.ToLower(parts[0])
+
+		switch cmd {
+		case "help":
+			printConsoleHelp()
+		case "exit", "quit":
+			return nil
+		case "target":
+			if len(parts) < 2 {
+				fmt.Println("usage: target <host:port>")
+				continue
+			}
+			currentAddr = parts[1]
+			fmt.Printf("target switched to %s\n", currentAddr)
+		case "pubkey":
+			resp, err := sendControlRequest(currentAddr, controlRequest{Action: "get_committee_pubkey"}, *timeout)
+			if err != nil {
+				fmt.Printf("error: %v\n", err)
+				continue
+			}
+			fmt.Printf("committee_pub_key_hex=%s\n", resp.CommitteePubKey)
+		case "submit":
+			sessionID := fmt.Sprintf("session-%d", time.Now().Unix())
+			fmt.Printf("session id (default %s): ", sessionID)
+			sInput, _ := reader.ReadString('\n')
+			sInput = strings.TrimSpace(sInput)
+			if sInput != "" {
+				sessionID = sInput
+			}
+			fmt.Print("message: ")
+			msg, _ := reader.ReadString('\n')
+			msg = strings.TrimSpace(msg)
+			if msg == "" {
+				fmt.Println("message is required")
+				continue
+			}
+			if _, err := sendControlRequest(currentAddr, controlRequest{
+				Action:    "submit_sign_request",
+				SessionID: sessionID,
+				Message:   msg,
+			}, *timeout); err != nil {
+				fmt.Printf("error: %v\n", err)
+				continue
+			}
+			fmt.Printf("submitted session=%s\n", sessionID)
+		case "autosign":
+			if len(parts) < 2 || (parts[1] != "on" && parts[1] != "off") {
+				fmt.Println("usage: autosign <on|off>")
+				continue
+			}
+			enabled := parts[1] == "on"
+			if _, err := sendControlRequest(currentAddr, controlRequest{
+				Action:  "set_auto_sign",
+				Enabled: enabled,
+			}, *timeout); err != nil {
+				fmt.Printf("error: %v\n", err)
+				continue
+			}
+			fmt.Printf("auto-sign set to %v\n", enabled)
+		case "sign":
+			fmt.Print("session id: ")
+			sessionID, _ := reader.ReadString('\n')
+			sessionID = strings.TrimSpace(sessionID)
+			if sessionID == "" {
+				fmt.Println("session id is required")
+				continue
+			}
+			fmt.Print("message override (optional): ")
+			msg, _ := reader.ReadString('\n')
+			msg = strings.TrimSpace(msg)
+			if _, err := sendControlRequest(currentAddr, controlRequest{
+				Action:    "sign_session",
+				SessionID: sessionID,
+				Message:   msg,
+			}, *timeout); err != nil {
+				fmt.Printf("error: %v\n", err)
+				continue
+			}
+			fmt.Printf("manual sign triggered session=%s\n", sessionID)
+		default:
+			fmt.Println("unknown command, type 'help'")
+		}
+	}
+}
+
+func printConsoleHelp() {
+	fmt.Println("commands:")
+	fmt.Println("  help                    show this help")
+	fmt.Println("  target <host:port>      switch target control address")
+	fmt.Println("  submit                  create a new signing request (interactive prompt)")
+	fmt.Println("  pubkey                  query committee public key hex")
+	fmt.Println("  autosign <on|off>       set node auto signing mode")
+	fmt.Println("  sign                    manually sign queued session (interactive prompt)")
+	fmt.Println("  exit                    quit console")
 }
 
 func sendControlRequest(controlAddr string, req controlRequest, timeout time.Duration) (*controlResponse, error) {
@@ -341,6 +468,7 @@ func printUsage() {
 	fmt.Println("  committee-mvp admin set-auto-sign --control-addr 127.0.0.1:4402 --enabled=false")
 	fmt.Println("  committee-mvp admin sign-session --control-addr 127.0.0.1:4402 --session s1")
 	fmt.Println("  committee-mvp admin get-committee-pubkey --control-addr 127.0.0.1:4401")
+	fmt.Println("  committee-mvp admin console --control-addr 127.0.0.1:4401")
 	fmt.Println("  committee-mvp admin add-peer --from node-1 --peer node-9 --addr 127.0.0.1:3409")
 	fmt.Println("  committee-mvp version")
 }

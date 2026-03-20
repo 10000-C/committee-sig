@@ -49,7 +49,7 @@ if ! [[ "$THRESHOLD" =~ ^[0-9]+$ ]] || [[ "$THRESHOLD" -lt 1 ]] || [[ "$THRESHOL
   exit 1
 fi
 
-"$ROOT_DIR/scripts/gen-node-configs.sh" -n "$NODE_COUNT" -t "$THRESHOLD" -c "$COORDINATOR_ID"
+"$ROOT_DIR/scripts/gen.sh" -n "$NODE_COUNT" -t "$THRESHOLD" -c "$COORDINATOR_ID"
 
 pids=()
 session_id="session-$(date +%s)"
