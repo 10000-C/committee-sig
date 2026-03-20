@@ -3,7 +3,8 @@ package committee
 import (
 	"bufio"
 	"context"
-	"crypto/sha256"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -17,6 +18,7 @@ import (
 	"committee-mvp/internal/config"
 	"committee-mvp/internal/crypto"
 	"committee-mvp/internal/p2p"
+	"committee-mvp/internal/share"
 	"committee-mvp/internal/wire"
 )
 
@@ -29,8 +31,15 @@ type Service struct {
 	nodeIndex int
 
 	nonce uint64
+	autoSign uint32
+	dkgOnce  sync.Once
+	dkgReady chan struct{}
 
 	sessions map[string]*signSession
+	pending  map[string]pendingSignRequest
+	dkgShares map[int]*big.Int
+	dealerPubKeys map[int][]byte
+	committeePubKey []byte
 	mu       sync.Mutex
 	controlL net.Listener
 
@@ -42,6 +51,11 @@ type signSession struct {
 	responses     map[int]wire.SignResponsePayload
 	aggregated    bool
 	requestNonce  uint64
+}
+
+type pendingSignRequest struct {
+	message []byte
+	epoch   uint64
 }
 
 func NewService(cfg *config.NodeConfig) *Service {
@@ -67,7 +81,12 @@ func NewServiceWithNetwork(cfg *config.NodeConfig, netw p2p.Network) *Service {
 		net:       netw,
 		bls:       bls,
 		nodeIndex: idx,
+		autoSign:  1,
+		dkgReady:  make(chan struct{}),
 		sessions:  make(map[string]*signSession),
+		pending:   make(map[string]pendingSignRequest),
+		dkgShares: make(map[int]*big.Int),
+		dealerPubKeys: make(map[int][]byte),
 	}
 }
 
@@ -94,6 +113,8 @@ func (s *Service) Start(ctx context.Context) error {
 			}
 		}
 	}()
+
+	s.startDKG(ctx)
 	return nil
 }
 
@@ -144,11 +165,13 @@ type controlRequest struct {
 	Action    string `json:"action"`
 	SessionID string `json:"session_id"`
 	Message   string `json:"message"`
+	Enabled   bool   `json:"enabled"`
 }
 
 type controlResponse struct {
-	OK    bool   `json:"ok"`
-	Error string `json:"error,omitempty"`
+	OK              bool   `json:"ok"`
+	Error           string `json:"error,omitempty"`
+	CommitteePubKey string `json:"committee_pub_key,omitempty"`
 }
 
 func (s *Service) handleControlConn(conn net.Conn) {
@@ -164,21 +187,42 @@ func (s *Service) handleControlConn(conn net.Conn) {
 		_ = json.NewEncoder(conn).Encode(controlResponse{OK: false, Error: fmt.Sprintf("decode request: %v", err)})
 		return
 	}
-	if req.Action != "submit_sign_request" {
+	switch req.Action {
+	case "submit_sign_request":
+		if err := s.SubmitSignRequest(req.SessionID, []byte(req.Message)); err != nil {
+			_ = json.NewEncoder(conn).Encode(controlResponse{OK: false, Error: err.Error()})
+			return
+		}
+		_ = json.NewEncoder(conn).Encode(controlResponse{OK: true})
+	case "set_auto_sign":
+		s.setAutoSign(req.Enabled)
+		_ = json.NewEncoder(conn).Encode(controlResponse{OK: true})
+	case "sign_session":
+		if err := s.SubmitLocalSign(req.SessionID, []byte(req.Message)); err != nil {
+			_ = json.NewEncoder(conn).Encode(controlResponse{OK: false, Error: err.Error()})
+			return
+		}
+		_ = json.NewEncoder(conn).Encode(controlResponse{OK: true})
+	case "get_committee_pubkey":
+		pub, err := s.CommitteePublicKey()
+		if err != nil {
+			_ = json.NewEncoder(conn).Encode(controlResponse{OK: false, Error: err.Error()})
+			return
+		}
+		_ = json.NewEncoder(conn).Encode(controlResponse{OK: true, CommitteePubKey: hex.EncodeToString(pub)})
+	default:
 		_ = json.NewEncoder(conn).Encode(controlResponse{OK: false, Error: "unsupported action"})
 		return
 	}
-	if err := s.SubmitSignRequest(req.SessionID, []byte(req.Message)); err != nil {
-		_ = json.NewEncoder(conn).Encode(controlResponse{OK: false, Error: err.Error()})
-		return
-	}
-	_ = json.NewEncoder(conn).Encode(controlResponse{OK: true})
 }
 
 // SubmitSignRequest can be used by coordinator to trigger one signing round.
 func (s *Service) SubmitSignRequest(sessionID string, message []byte) error {
 	if s.cfg.NodeID != s.cfg.CoordinatorID {
 		return fmt.Errorf("only coordinator can submit sign request")
+	}
+	if !s.isDKGReady() {
+		return fmt.Errorf("committee key not ready yet")
 	}
 	if sessionID == "" {
 		return fmt.Errorf("session id is required")
@@ -216,6 +260,8 @@ func (s *Service) handleEnvelope(msg wire.Envelope) {
 		return
 	}
 	switch msg.Type {
+	case wire.MsgDealShare:
+		s.onDealShare(msg)
 	case wire.MsgSignRequest:
 		s.onSignRequest(msg)
 	case wire.MsgSignResponse:
@@ -225,7 +271,189 @@ func (s *Service) handleEnvelope(msg wire.Envelope) {
 	}
 }
 
+func (s *Service) startDKG(ctx context.Context) {
+	s.dkgOnce.Do(func() {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(2 * time.Second):
+			}
+			if err := s.broadcastDealerShares(); err != nil {
+				log.Printf("dkg broadcast shares failed node_id=%s err=%v", s.cfg.NodeID, err)
+			}
+		}()
+	})
+}
+
+func (s *Service) broadcastDealerShares() error {
+	if s.nodeIndex < 0 || s.nodeIndex >= s.cfg.CommitteeSize {
+		return fmt.Errorf("invalid node index %d", s.nodeIndex)
+	}
+
+	secret, err := rand.Int(rand.Reader, frCompat{}.Modulus())
+	if err != nil {
+		return fmt.Errorf("sample dealer secret: %w", err)
+	}
+	if secret.Sign() == 0 {
+		secret.SetInt64(1)
+	}
+	dealerSigner, err := crypto.NewBN254BLSFromBigInt(secret, s.cfg.DomainSeparation)
+	if err != nil {
+		return fmt.Errorf("new dealer signer: %w", err)
+	}
+	dealerPub, err := dealerSigner.PublicKey()
+	if err != nil {
+		return fmt.Errorf("derive dealer public key: %w", err)
+	}
+
+	shares, err := share.Split(secret, s.cfg.Threshold, s.cfg.CommitteeSize)
+	if err != nil {
+		return fmt.Errorf("split dealer shares: %w", err)
+	}
+
+	for _, sh := range shares {
+		recipientIdx := int(sh.Index) - 1
+		if recipientIdx < 0 || recipientIdx >= len(s.cfg.StaticNodes) {
+			continue
+		}
+		payload, err := wire.EncodePayload(wire.DealSharePayload{
+			DealerIndex:    s.nodeIndex,
+			RecipientIndex: recipientIdx,
+			ShareValue:     sh.Value.String(),
+			DealerPubKey:   dealerPub,
+		})
+		if err != nil {
+			return fmt.Errorf("encode deal share: %w", err)
+		}
+		s.net.Publish(wire.Envelope{
+			Type:      wire.MsgDealShare,
+			SessionID: "dkg-1",
+			Epoch:     1,
+			Nonce:     atomic.AddUint64(&s.nonce, 1),
+			From:      s.cfg.NodeID,
+			To:        s.cfg.StaticNodes[recipientIdx],
+			Version:   s.cfg.MessageVersion,
+			SentAt:    time.Now().UTC(),
+			Payload:   payload,
+		})
+	}
+	return nil
+}
+
+func (s *Service) onDealShare(msg wire.Envelope) {
+	var payload wire.DealSharePayload
+	if err := wire.DecodePayload(msg.Payload, &payload); err != nil {
+		log.Printf("decode deal-share failed from=%s err=%v", msg.From, err)
+		return
+	}
+	if payload.RecipientIndex != s.nodeIndex {
+		return
+	}
+	if payload.DealerIndex < 0 || payload.DealerIndex >= s.cfg.CommitteeSize {
+		return
+	}
+	v, ok := new(big.Int).SetString(payload.ShareValue, 10)
+	if !ok {
+		log.Printf("invalid share value from=%s", msg.From)
+		return
+	}
+	v.Mod(v, frCompat{}.Modulus())
+
+	s.mu.Lock()
+	if _, exists := s.dkgShares[payload.DealerIndex]; !exists {
+		s.dkgShares[payload.DealerIndex] = v
+	}
+	if _, exists := s.dealerPubKeys[payload.DealerIndex]; !exists {
+		s.dealerPubKeys[payload.DealerIndex] = append([]byte(nil), payload.DealerPubKey...)
+	}
+	ready := len(s.dkgShares) == s.cfg.CommitteeSize && len(s.dealerPubKeys) == s.cfg.CommitteeSize
+	s.mu.Unlock()
+
+	if ready {
+		s.finalizeDKG()
+	}
+}
+
+func (s *Service) finalizeDKG() {
+	s.mu.Lock()
+	if len(s.committeePubKey) > 0 {
+		s.mu.Unlock()
+		return
+	}
+	localShare := big.NewInt(0)
+	mod := frCompat{}.Modulus()
+	for _, v := range s.dkgShares {
+		localShare.Add(localShare, v)
+		localShare.Mod(localShare, mod)
+	}
+
+	pubs := make([][]byte, 0, len(s.dealerPubKeys))
+	for i := 0; i < s.cfg.CommitteeSize; i++ {
+		pk, ok := s.dealerPubKeys[i]
+		if !ok {
+			s.mu.Unlock()
+			return
+		}
+		pubs = append(pubs, pk)
+	}
+	bitmap := make([]byte, (s.cfg.CommitteeSize+7)/8)
+	for i := 0; i < s.cfg.CommitteeSize; i++ {
+		bitmap[i/8] |= 1 << uint(i%8)
+	}
+	aggPub, err := crypto.AggregatePublicKeys(pubs, bitmap)
+	if err != nil {
+		s.mu.Unlock()
+		log.Printf("dkg aggregate committee pubkey failed node_id=%s err=%v", s.cfg.NodeID, err)
+		return
+	}
+	bls, err := crypto.NewBN254BLSFromBigInt(localShare, s.cfg.DomainSeparation)
+	if err != nil {
+		s.mu.Unlock()
+		log.Printf("dkg create signer failed node_id=%s err=%v", s.cfg.NodeID, err)
+		return
+	}
+	s.bls = bls
+	s.committeePubKey = aggPub
+	readyCh := s.dkgReady
+	s.mu.Unlock()
+
+	select {
+	case <-readyCh:
+	default:
+		close(readyCh)
+	}
+	log.Printf("dkg completed node_id=%s committee_pub_ready=true", s.cfg.NodeID)
+}
+
+func (s *Service) isDKGReady() bool {
+	select {
+	case <-s.dkgReady:
+		return true
+	default:
+		return false
+	}
+}
+
+// CommitteePublicKey returns the fixed committee-level public key once DKG is complete.
+func (s *Service) CommitteePublicKey() ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.committeePubKey) == 0 {
+		return nil, fmt.Errorf("committee key not ready yet")
+	}
+	out := make([]byte, len(s.committeePubKey))
+	copy(out, s.committeePubKey)
+	return out, nil
+}
+
 func (s *Service) onSignRequest(msg wire.Envelope) {
+	if !s.isDKGReady() {
+		log.Printf("ignore sign request before dkg ready session_id=%s node_id=%s", msg.SessionID, s.cfg.NodeID)
+		return
+	}
 	var req wire.SignRequestPayload
 	if err := wire.DecodePayload(msg.Payload, &req); err != nil {
 		log.Printf("decode sign request failed session_id=%s err=%v", msg.SessionID, err)
@@ -248,15 +476,30 @@ func (s *Service) onSignRequest(msg wire.Envelope) {
 		s.mu.Unlock()
 	}
 
-	shareSig, err := s.bls.SignShare(req.Message)
-	if err != nil {
-		log.Printf("sign share failed session_id=%s node_id=%s err=%v", msg.SessionID, s.cfg.NodeID, err)
+	if !s.isAutoSignEnabled() {
+		s.mu.Lock()
+		s.pending[msg.SessionID] = pendingSignRequest{
+			message: append([]byte(nil), req.Message...),
+			epoch:   msg.Epoch,
+		}
+		s.mu.Unlock()
+		log.Printf("auto signing disabled, request queued session_id=%s node_id=%s", msg.SessionID, s.cfg.NodeID)
 		return
+	}
+
+	if err := s.publishSignResponse(msg.SessionID, msg.Epoch, req.Message); err != nil {
+		log.Printf("publish sign response failed session_id=%s node_id=%s err=%v", msg.SessionID, s.cfg.NodeID, err)
+	}
+}
+
+func (s *Service) publishSignResponse(sessionID string, epoch uint64, message []byte) error {
+	shareSig, err := s.bls.SignShare(message)
+	if err != nil {
+		return fmt.Errorf("sign share failed: %w", err)
 	}
 	pub, err := s.bls.PublicKey()
 	if err != nil {
-		log.Printf("derive pubkey failed session_id=%s node_id=%s err=%v", msg.SessionID, s.cfg.NodeID, err)
-		return
+		return fmt.Errorf("derive pubkey failed: %w", err)
 	}
 	respPayload, err := wire.EncodePayload(wire.SignResponsePayload{
 		SignerIndex:    s.nodeIndex,
@@ -264,13 +507,12 @@ func (s *Service) onSignRequest(msg wire.Envelope) {
 		SignerPubKey:   pub,
 	})
 	if err != nil {
-		log.Printf("encode sign response failed session_id=%s node_id=%s err=%v", msg.SessionID, s.cfg.NodeID, err)
-		return
+		return fmt.Errorf("encode sign response failed: %w", err)
 	}
 	s.net.Publish(wire.Envelope{
 		Type:      wire.MsgSignResponse,
-		SessionID: msg.SessionID,
-		Epoch:     msg.Epoch,
+		SessionID: sessionID,
+		Epoch:     epoch,
 		Nonce:     atomic.AddUint64(&s.nonce, 1),
 		From:      s.cfg.NodeID,
 		To:        s.cfg.CoordinatorID,
@@ -278,6 +520,49 @@ func (s *Service) onSignRequest(msg wire.Envelope) {
 		SentAt:    time.Now().UTC(),
 		Payload:   respPayload,
 	})
+	return nil
+}
+
+// SubmitLocalSign signs a pending session on this node and sends a SIGN_RESPONSE to coordinator.
+func (s *Service) SubmitLocalSign(sessionID string, messageOverride []byte) error {
+	if sessionID == "" {
+		return fmt.Errorf("session id is required")
+	}
+	epoch := uint64(1)
+	message := append([]byte(nil), messageOverride...)
+
+	s.mu.Lock()
+	if pending, ok := s.pending[sessionID]; ok {
+		if len(message) == 0 {
+			message = append([]byte(nil), pending.message...)
+		}
+		epoch = pending.epoch
+		delete(s.pending, sessionID)
+	}
+	s.mu.Unlock()
+
+	if len(message) == 0 {
+		return fmt.Errorf("no queued request for session %s and message override is empty", sessionID)
+	}
+	if err := s.publishSignResponse(sessionID, epoch, message); err != nil {
+		return err
+	}
+	log.Printf("manual sign response sent session_id=%s node_id=%s", sessionID, s.cfg.NodeID)
+	return nil
+}
+
+func (s *Service) setAutoSign(enabled bool) {
+	if enabled {
+		atomic.StoreUint32(&s.autoSign, 1)
+		log.Printf("auto sign enabled node_id=%s", s.cfg.NodeID)
+		return
+	}
+	atomic.StoreUint32(&s.autoSign, 0)
+	log.Printf("auto sign disabled node_id=%s", s.cfg.NodeID)
+}
+
+func (s *Service) isAutoSignEnabled() bool {
+	return atomic.LoadUint32(&s.autoSign) == 1
 }
 
 func (s *Service) onSignResponse(msg wire.Envelope) {
@@ -332,31 +617,25 @@ func (s *Service) onSignResponse(msg wire.Envelope) {
 	bitmap := makeBitmap(indices, s.cfg.CommitteeSize)
 
 	sigs := make([][]byte, 0, len(indices))
-	pubs := make([][]byte, 0, len(indices))
 	for _, idx := range indices {
 		sigs = append(sigs, state.responses[idx].ShareSignature)
-		pubs = append(pubs, state.responses[idx].SignerPubKey)
 	}
 	message := append([]byte(nil), state.message...)
+	committeePub := append([]byte(nil), s.committeePubKey...)
 	s.mu.Unlock()
-	aggSig, err := s.bls.AggregateSignatures(sigs, bitmap)
+	aggSig, err := crypto.AggregateThresholdSignatures(sigs, indices)
 	if err != nil {
 		log.Printf("aggregate signatures failed session_id=%s err=%v", msg.SessionID, err)
 		return
 	}
-	aggPub, err := crypto.AggregatePublicKeys(pubs, bitmap)
-	if err != nil {
-		log.Printf("aggregate public keys failed session_id=%s err=%v", msg.SessionID, err)
-		return
-	}
-	if err := s.bls.VerifyAggregate(aggPub, message, aggSig, bitmap); err != nil {
+	if err := s.bls.VerifyAggregate(committeePub, message, aggSig, bitmap); err != nil {
 		log.Printf("aggregate verify failed session_id=%s err=%v", msg.SessionID, err)
 		return
 	}
 	resultPayload, err := wire.EncodePayload(wire.AggResultPayload{
 		Bitmap:             bitmap,
 		AggregateSig:       aggSig,
-		AggregatePublicKey: aggPub,
+		AggregatePublicKey: committeePub,
 		Message:            message,
 	})
 	if err != nil {
@@ -402,17 +681,8 @@ func indexOfNode(nodes []string, nodeID string) int {
 }
 
 func derivePrivateKey(nodeID string) *big.Int {
-	h := sha256.Sum256([]byte("committee-sig/mvp/sk/" + nodeID))
-	bi := new(big.Int).SetBytes(h[:])
-	var e big.Int
-	var frOne frCompat
-	modulus := frOne.Modulus()
-	bi.Mod(bi, modulus)
-	if bi.Sign() == 0 {
-		bi.SetInt64(1)
-	}
-	e.Set(bi)
-	return &e
+	_ = nodeID
+	return nil
 }
 
 // frCompat keeps bn254 scalar modulus local to avoid importing fr in this layer.

@@ -92,11 +92,19 @@ func runNode(args []string) error {
 				return
 			case <-time.After(*autoDelay):
 			}
-			if err := svc.SubmitSignRequest(*autoSession, []byte(*autoMessage)); err != nil {
-				log.Printf("auto submit sign request failed: %v", err)
+			for {
+				if err := svc.SubmitSignRequest(*autoSession, []byte(*autoMessage)); err != nil {
+					log.Printf("auto submit sign request retrying: %v", err)
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(1 * time.Second):
+					}
+					continue
+				}
+				log.Printf("auto submit sign request sent session_id=%s", *autoSession)
 				return
 			}
-			log.Printf("auto submit sign request sent session_id=%s", *autoSession)
 		}()
 	}
 	<-ctx.Done()
@@ -108,11 +116,17 @@ func runNode(args []string) error {
 
 func runAdmin(args []string) error {
 	if len(args) < 1 {
-		return errors.New("missing admin subcommand: submit-sign-request | add-peer")
+		return errors.New("missing admin subcommand: submit-sign-request | set-auto-sign | sign-session | get-committee-pubkey | add-peer")
 	}
 	switch args[0] {
 	case "submit-sign-request":
 		return runSubmitSignRequest(args[1:])
+	case "set-auto-sign":
+		return runSetAutoSign(args[1:])
+	case "sign-session":
+		return runSignSession(args[1:])
+	case "get-committee-pubkey":
+		return runGetCommitteePubKey(args[1:])
 	case "add-peer":
 		return runAddPeer(args[1:])
 	default:
@@ -124,11 +138,13 @@ type controlRequest struct {
 	Action    string `json:"action"`
 	SessionID string `json:"session_id"`
 	Message   string `json:"message"`
+	Enabled   bool   `json:"enabled"`
 }
 
 type controlResponse struct {
-	OK    bool   `json:"ok"`
-	Error string `json:"error,omitempty"`
+	OK              bool   `json:"ok"`
+	Error           string `json:"error,omitempty"`
+	CommitteePubKey string `json:"committee_pub_key,omitempty"`
 }
 
 func runSubmitSignRequest(args []string) error {
@@ -144,30 +160,98 @@ func runSubmitSignRequest(args []string) error {
 	if *sessionID == "" || *message == "" {
 		return errors.New("session and message are required")
 	}
+	_, err := sendControlRequest(*controlAddr, controlRequest{
+		Action:    "submit_sign_request",
+		SessionID: *sessionID,
+		Message:   *message,
+	}, *timeout)
+	return err
+}
 
-	conn, err := net.DialTimeout("tcp", *controlAddr, *timeout)
+func runSetAutoSign(args []string) error {
+	fs := flag.NewFlagSet("admin set-auto-sign", flag.ContinueOnError)
+	fs.SetOutput(os.Stdout)
+	controlAddr := fs.String("control-addr", "127.0.0.1:4401", "node control address")
+	enabled := fs.Bool("enabled", true, "set true to enable auto signing, false to disable")
+	timeout := fs.Duration("timeout", 3*time.Second, "request timeout")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if _, err := sendControlRequest(*controlAddr, controlRequest{
+		Action:  "set_auto_sign",
+		Enabled: *enabled,
+	}, *timeout); err != nil {
+		return err
+	}
+	fmt.Printf("set auto-sign=%t on %s\n", *enabled, *controlAddr)
+	return nil
+}
+
+func runSignSession(args []string) error {
+	fs := flag.NewFlagSet("admin sign-session", flag.ContinueOnError)
+	fs.SetOutput(os.Stdout)
+	controlAddr := fs.String("control-addr", "127.0.0.1:4401", "node control address")
+	sessionID := fs.String("session", "", "session id")
+	message := fs.String("message", "", "optional message override if request is not queued locally")
+	timeout := fs.Duration("timeout", 3*time.Second, "request timeout")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *sessionID == "" {
+		return errors.New("session is required")
+	}
+	if _, err := sendControlRequest(*controlAddr, controlRequest{
+		Action:    "sign_session",
+		SessionID: *sessionID,
+		Message:   *message,
+	}, *timeout); err != nil {
+		return err
+	}
+	fmt.Printf("manual sign triggered session=%s on %s\n", *sessionID, *controlAddr)
+	return nil
+}
+
+func runGetCommitteePubKey(args []string) error {
+	fs := flag.NewFlagSet("admin get-committee-pubkey", flag.ContinueOnError)
+	fs.SetOutput(os.Stdout)
+	controlAddr := fs.String("control-addr", "127.0.0.1:4401", "node control address")
+	timeout := fs.Duration("timeout", 3*time.Second, "request timeout")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	resp, err := sendControlRequest(*controlAddr, controlRequest{Action: "get_committee_pubkey"}, *timeout)
 	if err != nil {
-		return fmt.Errorf("dial %s: %w", *controlAddr, err)
+		return err
+	}
+	if resp.CommitteePubKey == "" {
+		return errors.New("empty committee public key in response")
+	}
+	fmt.Printf("committee_pub_key_hex=%s\n", resp.CommitteePubKey)
+	return nil
+}
+
+func sendControlRequest(controlAddr string, req controlRequest, timeout time.Duration) (*controlResponse, error) {
+	conn, err := net.DialTimeout("tcp", controlAddr, timeout)
+	if err != nil {
+		return nil, fmt.Errorf("dial %s: %w", controlAddr, err)
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(*timeout))
+	_ = conn.SetDeadline(time.Now().Add(timeout))
 
-	req := controlRequest{Action: "submit_sign_request", SessionID: *sessionID, Message: *message}
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
-		return fmt.Errorf("encode request: %w", err)
+		return nil, fmt.Errorf("encode request: %w", err)
 	}
 	var resp controlResponse
 	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
-		return fmt.Errorf("decode response: %w", err)
+		return nil, fmt.Errorf("decode response: %w", err)
 	}
 	if !resp.OK {
 		if resp.Error == "" {
 			resp.Error = "unknown error"
 		}
-		return errors.New(resp.Error)
+		return nil, errors.New(resp.Error)
 	}
-	fmt.Printf("submitted sign request session=%s to %s\n", *sessionID, *controlAddr)
-	return nil
+	return &resp, nil
 }
 
 func runAddPeer(args []string) error {
@@ -254,6 +338,9 @@ func printUsage() {
 	fmt.Println("  committee-mvp [global flags]                  # default to node")
 	fmt.Println("  committee-mvp node --config configs/devnet.json")
 	fmt.Println("  committee-mvp admin submit-sign-request --control-addr 127.0.0.1:4401 --session s1 --message hello")
+	fmt.Println("  committee-mvp admin set-auto-sign --control-addr 127.0.0.1:4402 --enabled=false")
+	fmt.Println("  committee-mvp admin sign-session --control-addr 127.0.0.1:4402 --session s1")
+	fmt.Println("  committee-mvp admin get-committee-pubkey --control-addr 127.0.0.1:4401")
 	fmt.Println("  committee-mvp admin add-peer --from node-1 --peer node-9 --addr 127.0.0.1:3409")
 	fmt.Println("  committee-mvp version")
 }

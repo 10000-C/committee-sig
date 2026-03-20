@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/big"
 	"math/bits"
+	"sort"
 
 	"github.com/consensys/gnark-crypto/ecc/bn254"
 	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
@@ -185,6 +186,101 @@ func (b *BN254BLS) VerifyAggregate(aggregatePub, message, aggregateSig, bitmap [
 		return ErrVerifyFailed
 	}
 	return nil
+}
+
+// AggregateThresholdSignatures combines partial signatures via Lagrange interpolation at x=0.
+// signerIndices are zero-based committee indices aligned with sigs.
+func AggregateThresholdSignatures(sigs [][]byte, signerIndices []int) ([]byte, error) {
+	if len(sigs) == 0 || len(sigs) != len(signerIndices) {
+		return nil, ErrInvalidBitmap
+	}
+	type pair struct {
+		idx int
+		sig []byte
+	}
+	pairs := make([]pair, 0, len(sigs))
+	seen := make(map[int]struct{}, len(sigs))
+	for i := range sigs {
+		if len(sigs[i]) == 0 {
+			return nil, ErrInvalidPoint
+		}
+		if signerIndices[i] < 0 {
+			return nil, ErrInvalidBitmap
+		}
+		if _, ok := seen[signerIndices[i]]; ok {
+			return nil, ErrDuplicateSigner
+		}
+		seen[signerIndices[i]] = struct{}{}
+		pairs = append(pairs, pair{idx: signerIndices[i], sig: sigs[i]})
+	}
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].idx < pairs[j].idx })
+
+	xs := make([]*big.Int, 0, len(pairs))
+	points := make([]bn254.G1Affine, 0, len(pairs))
+	for _, p := range pairs {
+		x := big.NewInt(int64(p.idx + 1))
+		xs = append(xs, x)
+		var sig bn254.G1Affine
+		if err := sig.Unmarshal(p.sig); err != nil {
+			return nil, fmt.Errorf("decode signature: %w", ErrInvalidPoint)
+		}
+		points = append(points, sig)
+	}
+
+	var acc bn254.G1Affine
+	set := false
+	for i := range points {
+		lambda, err := lagrangeCoeffAtZero(xs, i)
+		if err != nil {
+			return nil, err
+		}
+		var li fr.Element
+		li.SetBigInt(lambda)
+		coeff := li.ToBigIntRegular(new(big.Int))
+		term := new(bn254.G1Affine).ScalarMultiplication(&points[i], coeff)
+		if !set {
+			acc.Set(term)
+			set = true
+			continue
+		}
+		acc.Add(&acc, term)
+	}
+	if !set {
+		return nil, ErrInvalidBitmap
+	}
+	return acc.Marshal(), nil
+}
+
+func lagrangeCoeffAtZero(xs []*big.Int, i int) (*big.Int, error) {
+	if i < 0 || i >= len(xs) {
+		return nil, ErrInvalidBitmap
+	}
+	mod := fr.Modulus()
+	num := big.NewInt(1)
+	den := big.NewInt(1)
+	xi := new(big.Int).Set(xs[i])
+	for j := range xs {
+		if j == i {
+			continue
+		}
+		xj := new(big.Int).Set(xs[j])
+		negXj := new(big.Int).Neg(xj)
+		negXj.Mod(negXj, mod)
+		num.Mul(num, negXj)
+		num.Mod(num, mod)
+
+		diff := new(big.Int).Sub(xi, xj)
+		diff.Mod(diff, mod)
+		den.Mul(den, diff)
+		den.Mod(den, mod)
+	}
+	inv := new(big.Int).ModInverse(den, mod)
+	if inv == nil {
+		return nil, ErrInvalidBitmap
+	}
+	out := new(big.Int).Mul(num, inv)
+	out.Mod(out, mod)
+	return out, nil
 }
 
 func AggregatePublicKeys(pubkeys [][]byte, bitmap []byte) ([]byte, error) {

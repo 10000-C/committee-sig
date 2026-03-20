@@ -1,20 +1,20 @@
 package committee
 
 import (
-	"context"
+	"bytes"
+	"math/big"
 	"testing"
-	"time"
 
 	"committee-mvp/internal/config"
 	"committee-mvp/internal/crypto"
-	"committee-mvp/internal/wire"
+	"committee-mvp/internal/share"
 )
 
-func TestCoordinatorAggregatesAfterThresholdResponses(t *testing.T) {
+func TestFinalizeDKGBuildsStableCommitteePubKey(t *testing.T) {
 	cfg := &config.NodeConfig{
-		NodeID:           "node-1",
-		ListenAddr:       "127.0.0.1:3401",
-		StaticNodes:      []string{"node-1", "node-2", "node-3", "node-4", "node-5", "node-6", "node-7", "node-8"},
+		NodeID:      "node-1",
+		ListenAddr:  "127.0.0.1:3401",
+		StaticNodes: []string{"node-1", "node-2", "node-3", "node-4", "node-5", "node-6", "node-7", "node-8"},
 		StaticNodeAddrs: map[string]string{
 			"node-1": "127.0.0.1:3401",
 			"node-2": "127.0.0.1:3402",
@@ -32,70 +32,46 @@ func TestCoordinatorAggregatesAfterThresholdResponses(t *testing.T) {
 		MessageVersion:   "v1",
 	}
 
-	svc := NewService(cfg)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	if err := svc.Start(ctx); err != nil {
-		t.Fatalf("start service: %v", err)
-	}
-	defer func() {
-		if err := svc.Stop(context.Background()); err != nil {
-			t.Fatalf("stop service: %v", err)
+	s := NewService(cfg)
+	var expectedPubs [][]byte
+	for dealerIdx := 0; dealerIdx < cfg.CommitteeSize; dealerIdx++ {
+		secret := bigIntFromInt64(int64(100 + dealerIdx))
+		shs, err := share.Split(secret, cfg.Threshold, cfg.CommitteeSize)
+		if err != nil {
+			t.Fatalf("split dealer %d: %v", dealerIdx, err)
 		}
-	}()
+		s.dkgShares[dealerIdx] = shs[0].Value // node-1 gets index=1 share
 
-	sessionID := "sess-1"
-	message := []byte("test-sign-round")
-	if err := svc.SubmitSignRequest(sessionID, message); err != nil {
-		t.Fatalf("submit sign request: %v", err)
-	}
-
-	for _, nodeID := range []string{"node-2", "node-3", "node-4", "node-5"} {
-		signer, err := crypto.NewBN254BLSFromBigInt(derivePrivateKey(nodeID), cfg.DomainSeparation)
+		d, err := crypto.NewBN254BLSFromBigInt(secret, cfg.DomainSeparation)
 		if err != nil {
-			t.Fatalf("new signer %s: %v", nodeID, err)
+			t.Fatalf("new dealer signer %d: %v", dealerIdx, err)
 		}
-		sig, err := signer.SignShare(message)
+		pub, err := d.PublicKey()
 		if err != nil {
-			t.Fatalf("sign share %s: %v", nodeID, err)
+			t.Fatalf("dealer pub %d: %v", dealerIdx, err)
 		}
-		pk, err := signer.PublicKey()
-		if err != nil {
-			t.Fatalf("public key %s: %v", nodeID, err)
-		}
-		payload, err := wire.EncodePayload(wire.SignResponsePayload{
-			SignerIndex:    indexOfNode(cfg.StaticNodes, nodeID),
-			ShareSignature: sig,
-			SignerPubKey:   pk,
-		})
-		if err != nil {
-			t.Fatalf("encode payload %s: %v", nodeID, err)
-		}
-		svc.net.Publish(wire.Envelope{
-			Type:      wire.MsgSignResponse,
-			SessionID: sessionID,
-			Epoch:     1,
-			Nonce:     100,
-			From:      nodeID,
-			To:        cfg.CoordinatorID,
-			Version:   cfg.MessageVersion,
-			SentAt:    time.Now().UTC(),
-			Payload:   payload,
-		})
+		s.dealerPubKeys[dealerIdx] = pub
+		expectedPubs = append(expectedPubs, pub)
 	}
 
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		state, ok := svc.sessions[sessionID]
-		if ok && state.aggregated {
-			if len(state.responses) < cfg.Threshold {
-				t.Fatalf("responses below threshold: got=%d want>=%d", len(state.responses), cfg.Threshold)
-			}
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("timeout waiting for aggregation")
-		}
-		time.Sleep(10 * time.Millisecond)
+	fullBitmap := make([]byte, (cfg.CommitteeSize+7)/8)
+	for i := 0; i < cfg.CommitteeSize; i++ {
+		fullBitmap[i/8] |= 1 << uint(i%8)
 	}
+	expectedCommitteePub, err := crypto.AggregatePublicKeys(expectedPubs, fullBitmap)
+	if err != nil {
+		t.Fatalf("aggregate expected committee pub: %v", err)
+	}
+
+	s.finalizeDKG()
+	if !s.isDKGReady() {
+		t.Fatalf("dkg not marked ready")
+	}
+	if !bytes.Equal(s.committeePubKey, expectedCommitteePub) {
+		t.Fatalf("committee public key mismatch")
+	}
+}
+
+func bigIntFromInt64(v int64) *big.Int {
+	return new(big.Int).SetInt64(v)
 }

@@ -32,6 +32,13 @@ type SignRequestPayload struct {
 	Message []byte `json:"message"`
 }
 
+type DealSharePayload struct {
+	DealerIndex    int    `json:"dealer_index"`
+	RecipientIndex int    `json:"recipient_index"`
+	ShareValue     string `json:"share_value"`
+	DealerPubKey   []byte `json:"dealer_pub_key"`
+}
+
 type SignResponsePayload struct {
 	SignerIndex    int    `json:"signer_index"`
 	ShareSignature []byte `json:"share_signature"`
