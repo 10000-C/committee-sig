@@ -40,6 +40,8 @@ type Service struct {
 	dkgShares map[int]*big.Int
 	dealerPubKeys map[int][]byte
 	committeePubKey []byte
+	aggResults map[string]wire.AggResultPayload
+	lastAggSessionID string
 	mu       sync.Mutex
 	controlL net.Listener
 
@@ -87,6 +89,7 @@ func NewServiceWithNetwork(cfg *config.NodeConfig, netw p2p.Network) *Service {
 		pending:   make(map[string]pendingSignRequest),
 		dkgShares: make(map[int]*big.Int),
 		dealerPubKeys: make(map[int][]byte),
+		aggResults: make(map[string]wire.AggResultPayload),
 	}
 }
 
@@ -172,6 +175,11 @@ type controlResponse struct {
 	OK              bool   `json:"ok"`
 	Error           string `json:"error,omitempty"`
 	CommitteePubKey string `json:"committee_pub_key,omitempty"`
+	SessionID        string `json:"session_id,omitempty"`
+	Message          string `json:"message,omitempty"`
+	Bitmap           string `json:"bitmap,omitempty"`
+	AggregateSig     string `json:"aggregate_sig,omitempty"`
+	AggregatePubKey  string `json:"aggregate_pub_key,omitempty"`
 }
 
 func (s *Service) handleControlConn(conn net.Conn) {
@@ -210,6 +218,20 @@ func (s *Service) handleControlConn(conn net.Conn) {
 			return
 		}
 		_ = json.NewEncoder(conn).Encode(controlResponse{OK: true, CommitteePubKey: hex.EncodeToString(pub)})
+	case "get_agg_result":
+		sessionID, result, err := s.AggregateResult(req.SessionID)
+		if err != nil {
+			_ = json.NewEncoder(conn).Encode(controlResponse{OK: false, Error: err.Error()})
+			return
+		}
+		_ = json.NewEncoder(conn).Encode(controlResponse{
+			OK:             true,
+			SessionID:      sessionID,
+			Message:        string(result.Message),
+			Bitmap:         hex.EncodeToString(result.Bitmap),
+			AggregateSig:   hex.EncodeToString(result.AggregateSig),
+			AggregatePubKey: hex.EncodeToString(result.AggregatePublicKey),
+		})
 	default:
 		_ = json.NewEncoder(conn).Encode(controlResponse{OK: false, Error: "unsupported action"})
 		return
@@ -449,6 +471,41 @@ func (s *Service) CommitteePublicKey() ([]byte, error) {
 	return out, nil
 }
 
+// AggregateResult returns the aggregate result for a session. If sessionID is empty, latest is returned.
+func (s *Service) AggregateResult(sessionID string) (string, wire.AggResultPayload, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if sessionID == "" {
+		sessionID = s.lastAggSessionID
+	}
+	if sessionID == "" {
+		return "", wire.AggResultPayload{}, fmt.Errorf("no aggregate result yet")
+	}
+	result, ok := s.aggResults[sessionID]
+	if !ok {
+		return "", wire.AggResultPayload{}, fmt.Errorf("aggregate result not found for session %s", sessionID)
+	}
+	copyResult := wire.AggResultPayload{
+		Bitmap:             append([]byte(nil), result.Bitmap...),
+		AggregateSig:       append([]byte(nil), result.AggregateSig...),
+		AggregatePublicKey: append([]byte(nil), result.AggregatePublicKey...),
+		Message:            append([]byte(nil), result.Message...),
+	}
+	return sessionID, copyResult, nil
+}
+
+func (s *Service) storeAggregateResult(sessionID string, result wire.AggResultPayload) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.aggResults[sessionID] = wire.AggResultPayload{
+		Bitmap:             append([]byte(nil), result.Bitmap...),
+		AggregateSig:       append([]byte(nil), result.AggregateSig...),
+		AggregatePublicKey: append([]byte(nil), result.AggregatePublicKey...),
+		Message:            append([]byte(nil), result.Message...),
+	}
+	s.lastAggSessionID = sessionID
+}
+
 func (s *Service) onSignRequest(msg wire.Envelope) {
 	if !s.isDKGReady() {
 		log.Printf("ignore sign request before dkg ready session_id=%s node_id=%s", msg.SessionID, s.cfg.NodeID)
@@ -645,6 +702,12 @@ func (s *Service) onSignResponse(msg wire.Envelope) {
 	s.mu.Lock()
 	state.aggregated = true
 	s.mu.Unlock()
+	s.storeAggregateResult(msg.SessionID, wire.AggResultPayload{
+		Bitmap:             bitmap,
+		AggregateSig:       aggSig,
+		AggregatePublicKey: committeePub,
+		Message:            message,
+	})
 	s.net.Publish(wire.Envelope{
 		Type:      wire.MsgAggResult,
 		SessionID: msg.SessionID,
@@ -668,6 +731,7 @@ func (s *Service) onAggResult(msg wire.Envelope) {
 		log.Printf("aggregate result verify failed session_id=%s from=%s err=%v", msg.SessionID, msg.From, err)
 		return
 	}
+	s.storeAggregateResult(msg.SessionID, result)
 	log.Printf("aggregate result accepted session_id=%s from=%s", msg.SessionID, msg.From)
 }
 

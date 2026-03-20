@@ -34,6 +34,7 @@ go run ./cmd/committee-mvp admin console --control-addr 127.0.0.1:4401
 进入后使用以下交互命令：
 - `submit`：交互输入 `session/message` 发起新签名请求
 - `pubkey`：查询固定委员会公钥（hex，可用于链上验签）
+- `result [session]`：查看聚合签名明文（hex）；不带 session 时返回最新一条
 - `target <host:port>`：切换控制目标节点
 - `autosign on|off`：开启/关闭目标节点自动签名
 - `sign`：手动触发目标节点签名某个会话

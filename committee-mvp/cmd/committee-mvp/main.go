@@ -148,6 +148,11 @@ type controlResponse struct {
 	OK              bool   `json:"ok"`
 	Error           string `json:"error,omitempty"`
 	CommitteePubKey string `json:"committee_pub_key,omitempty"`
+	SessionID       string `json:"session_id,omitempty"`
+	Message         string `json:"message,omitempty"`
+	Bitmap          string `json:"bitmap,omitempty"`
+	AggregateSig    string `json:"aggregate_sig,omitempty"`
+	AggregatePubKey string `json:"aggregate_pub_key,omitempty"`
 }
 
 func runSubmitSignRequest(args []string) error {
@@ -282,6 +287,21 @@ func runAdminConsole(args []string) error {
 				continue
 			}
 			fmt.Printf("committee_pub_key_hex=%s\n", resp.CommitteePubKey)
+		case "result":
+			sessionID := ""
+			if len(parts) >= 2 {
+				sessionID = parts[1]
+			}
+			resp, err := sendControlRequest(currentAddr, controlRequest{Action: "get_agg_result", SessionID: sessionID}, *timeout)
+			if err != nil {
+				fmt.Printf("error: %v\n", err)
+				continue
+			}
+			fmt.Printf("session=%s\n", resp.SessionID)
+			fmt.Printf("message=%s\n", resp.Message)
+			fmt.Printf("bitmap_hex=%s\n", resp.Bitmap)
+			fmt.Printf("aggregate_sig_hex=%s\n", resp.AggregateSig)
+			fmt.Printf("aggregate_pub_key_hex=%s\n", resp.AggregatePubKey)
 		case "submit":
 			sessionID := fmt.Sprintf("session-%d", time.Now().Unix())
 			fmt.Printf("session id (default %s): ", sessionID)
@@ -352,6 +372,7 @@ func printConsoleHelp() {
 	fmt.Println("  target <host:port>      switch target control address")
 	fmt.Println("  submit                  create a new signing request (interactive prompt)")
 	fmt.Println("  pubkey                  query committee public key hex")
+	fmt.Println("  result [session]        query aggregate result; omit session to get latest")
 	fmt.Println("  autosign <on|off>       set node auto signing mode")
 	fmt.Println("  sign                    manually sign queued session (interactive prompt)")
 	fmt.Println("  exit                    quit console")
